@@ -390,7 +390,9 @@ def load_state() -> Dict[str, Any]:
 
 
 def save_state(state: Dict[str, Any]) -> None:
-    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = STATE_FILE.with_suffix(STATE_FILE.suffix + '.tmp')
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.replace(STATE_FILE)
 
 
 def ensure_collection(client: QdrantClient, collection: str, dim: int) -> None:
@@ -812,7 +814,10 @@ def ingest(
             points_upserted += len(points)
 
         prev[spath] = file_hash
+        state["files"] = prev
+        save_state(state)
 
+    # final save (idempotent)
     state["files"] = prev
     save_state(state)
 
@@ -894,9 +899,10 @@ def query(
     for h in b:
         corpus_tokens.update(tokenize(h["text"], use_stemming=True))
 
-    if not query_tokens & corpus_tokens:
-        typer.echo("Der gesuchte Begriff kommt in den Quellen nicht vor.")
-        return
+    # TODO: dense Treffer auch prüfen?
+    #if not query_tokens & corpus_tokens:
+    #    typer.echo("Der gesuchte Begriff kommt in den Quellen nicht vor.")
+    #    return
 
     fused = rrf_fuse(d, b, rrf_k=rrf_k, max_out=top_out)
 
@@ -967,6 +973,69 @@ def query(
 
 
 @app.command()
+def health(
+    qdrant_url: str = typer.Option(DEFAULT_QDRANT_URL, "--qdrant-url", "--qdrant_storage-url", help="Qdrant URL."),
+    ollama_url: str = typer.Option(DEFAULT_OLLAMA_URL, "--ollama-url", "--ollama_data-url", help="Ollama URL."),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, "--embed-model", help="Embedding-Modell, das vorhanden sein sollte."),
+    chat_model: str = typer.Option(DEFAULT_CHAT_MODEL, "--chat-model", help="Chat-Modell, das vorhanden sein sollte."),
+    timeout: int = typer.Option(5, "--timeout", help="Timeout in Sekunden pro Check."),
+    show_models: bool = typer.Option(False, "--show-models", help="Vorhandene Ollama-Modelle ausgeben."),
+):
+    """
+    Health-Check für PoC-Komponenten:
+    - Qdrant erreichbar
+    - Ollama erreichbar
+    - optional: Modelle vorhanden (embed/chat)
+    """
+    ok = True
+
+    # Qdrant
+    try:
+        qc = QdrantClient(url=qdrant_url)
+        cols = qc.get_collections().collections
+        typer.secho(f"[OK] Qdrant erreichbar: {qdrant_url} (Collections: {len(cols)})", fg=typer.colors.GREEN)
+    except Exception as e:
+        ok = False
+        typer.secho(f"[FAIL] Qdrant nicht erreichbar: {qdrant_url} ({e})", fg=typer.colors.RED)
+
+    # Ollama version
+    models = []
+    try:
+        r = requests.get(f"{ollama_url}/api/version", timeout=timeout)
+        r.raise_for_status()
+        ver = (r.json() or {}).get("version", "?")
+        typer.secho(f"[OK] Ollama erreichbar: {ollama_url} (version: {ver})", fg=typer.colors.GREEN)
+    except Exception as e:
+        ok = False
+        typer.secho(f"[FAIL] Ollama nicht erreichbar: {ollama_url} ({e})", fg=typer.colors.RED)
+
+    # Ollama models
+    try:
+        r = requests.get(f"{ollama_url}/api/tags", timeout=timeout)
+        r.raise_for_status()
+        data = r.json() or {}
+        models = [m.get("name") for m in data.get("models", []) if isinstance(m, dict) and m.get("name")]
+        if show_models:
+            typer.secho(f"Ollama Modelle: {', '.join(models) if models else '(keine gefunden)'}", fg=typer.colors.CYAN)
+
+        # simple presence checks
+        if embed_model and models and embed_model not in models:
+            typer.secho(f"[WARN] Embedding-Modell nicht gefunden: {embed_model} (ggf. 'ollama pull {embed_model}')", fg=typer.colors.YELLOW)
+        else:
+            typer.secho(f"[OK] Embedding-Modell geprüft: {embed_model}", fg=typer.colors.GREEN)
+
+        if chat_model and models and chat_model not in models:
+            typer.secho(f"[WARN] Chat-Modell nicht gefunden: {chat_model} (ggf. 'ollama pull {chat_model}')", fg=typer.colors.YELLOW)
+        else:
+            typer.secho(f"[OK] Chat-Modell geprüft: {chat_model}", fg=typer.colors.GREEN)
+    except Exception as e:
+        # /api/tags kann in manchen Setups fehlen; dann nur warnen
+        typer.secho(f"[WARN] Ollama Modelle konnten nicht abgefragt werden (/api/tags): {e}", fg=typer.colors.YELLOW)
+
+    if not ok:
+        raise typer.Exit(code=1)
+
+@app.command()
 def reset_collection(
     qdrant_url: str = typer.Option(
         DEFAULT_QDRANT_URL,
@@ -976,12 +1045,41 @@ def reset_collection(
     ),
     collection: str = typer.Option(DEFAULT_COLLECTION, "--collection", help="Qdrant Collection Name."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Löschen ohne Rückfrage bestätigen."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Nur anzeigen, was passieren würde (nichts löschen)."),
 ):
     """
     Löscht eine komplette Qdrant-Collection (PoC/Neuaufbau).
 
     ACHTUNG: Diese Aktion ist destruktiv. Alle Vektoren & Payloads der Collection gehen verloren.
     """
+    client = QdrantClient(url=qdrant_url)
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        typer.secho(f"Collection '{collection}' existiert nicht – nichts zu tun.", fg=typer.colors.YELLOW)
+        return
+
+    # Count points (best effort)
+    points_count = None
+    try:
+        info = client.get_collection(collection_name=collection)
+        # qdrant-client kann je nach Version unterschiedliche Felder liefern
+        if hasattr(info, "points_count"):
+            points_count = info.points_count
+        elif hasattr(info, "status") and hasattr(info, "config"):
+            # fallback: nichts
+            points_count = None
+    except Exception:
+        pass
+
+    if points_count is not None:
+        typer.secho(f"Collection '{collection}' enthält {points_count} Punkte.", fg=typer.colors.CYAN)
+    else:
+        typer.secho(f"Collection '{collection}' existiert (Punktanzahl unbekannt).", fg=typer.colors.CYAN)
+
+    if dry_run:
+        typer.secho("[DRY-RUN] Collection würde gelöscht werden, es wurde nichts geändert.", fg=typer.colors.YELLOW)
+        return
+
     if not yes:
         typer.secho(
             f"⚠️  Diese Aktion löscht die Collection '{collection}' vollständig!",
@@ -991,12 +1089,6 @@ def reset_collection(
         if not typer.confirm("Fortfahren?"):
             typer.echo("Abgebrochen.")
             raise typer.Exit(code=0)
-
-    client = QdrantClient(url=qdrant_url)
-    existing = [c.name for c in client.get_collections().collections]
-    if collection not in existing:
-        typer.secho(f"Collection '{collection}' existiert nicht – nichts zu tun.", fg=typer.colors.YELLOW)
-        return
 
     client.delete_collection(collection_name=collection)
     typer.secho(f"Collection '{collection}' wurde gelöscht.", fg=typer.colors.GREEN, bold=True)
@@ -1044,10 +1136,25 @@ def reset_all(
             typer.echo("Abgebrochen.")
             raise typer.Exit(code=0)
 
+
     # Collection löschen (falls vorhanden)
     client = QdrantClient(url=qdrant_url)
     existing = [c.name for c in client.get_collections().collections]
     if collection in existing:
+        # Count points (best effort)
+        points_count = None
+        try:
+            info = client.get_collection(collection_name=collection)
+            if hasattr(info, "points_count"):
+                points_count = info.points_count
+        except Exception:
+            pass
+
+        if points_count is not None:
+            typer.secho(f"Collection '{collection}' enthält {points_count} Punkte.", fg=typer.colors.CYAN)
+        else:
+            typer.secho(f"Collection '{collection}' existiert (Punktanzahl unbekannt).", fg=typer.colors.CYAN)
+
         client.delete_collection(collection_name=collection)
         typer.secho(f"Collection '{collection}' wurde gelöscht.", fg=typer.colors.GREEN)
     else:
