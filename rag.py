@@ -9,6 +9,7 @@ import uuid
 import requests
 import snowballstemmer
 import typer
+import sys
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
@@ -410,6 +411,52 @@ def delete_points_for_source(client: QdrantClient, collection: str, source_path:
         ),
     )
 
+def _terminal_width(default: int = 100) -> int:
+    try:
+        return shutil.get_terminal_size(fallback=(default, 20)).columns
+    except Exception:
+        return default
+
+
+def render_progress(prefix: str, current: int, total: int) -> str:
+    """
+    Rendert einen Progress-Bar-String, dessen Länge sich an die Terminalbreite anpasst.
+    current ist 0..total.
+    """
+    total = max(1, total)
+    current = max(0, min(current, total))
+    pct = (current / total) * 100.0
+
+    # Prefix ggf. kürzen
+    term_w = _terminal_width()
+    prefix = prefix.strip()
+    if len(prefix) > 40:
+        prefix = "…" + prefix[-39:]
+
+    left = f"{prefix} {pct:6.2f}% ({current}/{total}) "
+    # 10 Zeichen als Sicherheitsmarge (z. B. bei sehr kleinen Terminals)
+    bar_space = max(10, term_w - len(left) - 2)
+
+    filled = int(bar_space * (current / total))
+    bar = "█" * filled + "░" * (bar_space - filled)
+    return f"{left}{bar}"
+
+
+def print_progress_line(line: str) -> None:
+    """
+    Schreibt die Progress-Zeile in-place (CR), ohne neue Zeile.
+    """
+    sys.stdout.write("\r" + line)
+    sys.stdout.flush()
+
+
+def clear_progress_line() -> None:
+    """
+    Löscht die aktuelle Zeile (z. B. vor normalem print()).
+    """
+    term_w = _terminal_width()
+    sys.stdout.write("\r" + (" " * term_w) + "\r")
+    sys.stdout.flush()
 
 # ----------------- BM25 persistence -----------------
 def bm25_write_rows(rows: List[Dict[str, Any]]) -> None:
@@ -596,6 +643,7 @@ def ingest(
     overlap: int = typer.Option(DEFAULT_OVERLAP, "--overlap", help="Chunk Overlap (Zeichen)."),
     max_file_bytes: int = typer.Option(DEFAULT_MAX_FILE_BYTES, "--max-file-bytes", help="Max. Dateigröße (Bytes)."),
     rebuild_bm25: bool = typer.Option(True, "--rebuild-bm25/--no-rebuild-bm25", help="BM25 Corpus aus Qdrant rebuilden."),
+    show_progress: bool = typer.Option(True, "--progress/--no-progress", help="Fortschritt pro Datei/Chunks anzeigen."),
 ):
     """
     Ingest:
@@ -607,17 +655,6 @@ def ingest(
     - optional BM25-Rebuild für konsistente Hybrid-Suche
     """
     client = QdrantClient(url=qdrant_url)
-
-    # --- Synonym-Expansion (deterministisch, optional) ---
-    syn_map = load_synonyms(synonyms_file)
-    bm25_question, added_syns = expand_query_with_synonyms(question, syn_map)
-    dense_question = bm25_question if expand_dense else question
-    if verbose and added_syns:
-        typer.secho(f"[INFO] Query expanded with: {', '.join(added_syns)}", fg=typer.colors.CYAN)
-        typer.secho(f"[INFO] BM25 query: {bm25_question}", fg=typer.colors.CYAN)
-        if expand_dense:
-            typer.secho(f"[INFO] Dense query: {dense_question}", fg=typer.colors.CYAN)
-
 
     # Dimension einmalig ermitteln
     test_vec = ollama_embed(ollama_url, embed_model, "dimension check")
@@ -667,7 +704,12 @@ def ingest(
         seen_chunk_hash = set()
 
         points = []
-        for idx, chunk in enumerate(chunks):
+        total_chunks = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            if show_progress:
+                line = render_progress(prefix=f"Chunks: {p.name}", current=idx - 1, total=total_chunks)
+                print_progress_line(line)
+
             ch = sha1_text(chunk)
             if ch in seen_chunk_hash:
                 continue
@@ -689,6 +731,12 @@ def ingest(
                 "file_type": suffix,
             }
             points.append(PointStruct(id=pid, vector=vec, payload=payload))
+
+        # Nach der Datei: Progress auf 100% und dann Zeile beenden
+        if show_progress and total_chunks > 0:
+            print_progress_line(render_progress(prefix=f"Chunks: {p.name}", current=total_chunks, total=total_chunks))
+            sys.stdout.write("\n")
+            sys.stdout.flush()
 
         if points:
             client.upsert(collection_name=collection, points=points)
@@ -743,6 +791,16 @@ def query(
 ):
     """Hybrid Query (Dense + BM25 + RRF) -> LLM Antwort + Referenzen."""
     client = QdrantClient(url=qdrant_url)
+
+    # --- Synonym-Expansion (deterministisch, optional) ---
+    syn_map = load_synonyms(synonyms_file)
+    bm25_question, added_syns = expand_query_with_synonyms(question, syn_map)
+    dense_question = bm25_question if expand_dense else question
+    if verbose and added_syns:
+        typer.secho(f"[INFO] Query expanded with: {', '.join(added_syns)}", fg=typer.colors.CYAN)
+        typer.secho(f"[INFO] BM25 query: {bm25_question}", fg=typer.colors.CYAN)
+        if expand_dense:
+            typer.secho(f"[INFO] Dense query: {dense_question}", fg=typer.colors.CYAN)
 
     t0 = time.time()
     d = dense_search(client, collection, ollama_url, embed_model, dense_question, top_k_dense)
