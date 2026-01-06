@@ -370,7 +370,7 @@ flowchart TD
 
 ---
 
-## Architekturentscheidungen (ADR)
+## Architekturentscheidungen (ADR - Architecture Decision Record)
 
 Dieses Kapitel dokumentiert bewusst getroffene Architekturentscheidungen für den PoC und deren Begründung.
 
