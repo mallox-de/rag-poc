@@ -9,6 +9,9 @@ Ziel ist es:
 - alles **lokal**, reproduzierbar und ohne Cloud-Abhängigkeit zu betreiben
 
 ---
+## Inhaltsverzeichnis
+
+[[TOC]]
 
 ## Architektur-Überblick
 
@@ -264,7 +267,20 @@ pip install qdrant-client requests beautifulsoup4 lxml \
 
 ---
 
-### Ollama installieren
+### Ollama Modelle laden (docker)
+
+Modelle laden:
+```bash
+docker exec -it ollama_data ollama pull bge-m3
+docker exec -it ollama_data ollama pull mistral:7b-instruct
+# optional
+docker exec -it ollama_data ollama pull llama3.2
+docker exec -it ollama_data ollama pull qwen2.5:7b-instruct
+```
+
+---
+
+### Ollama installieren (Apple Silicon / macOS)
 ```bash
 brew install ollama
 ```

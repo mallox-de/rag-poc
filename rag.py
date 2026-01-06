@@ -37,9 +37,9 @@ DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "kb_poc"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
-DEFAULT_CHAT_MODEL = "mistral:7b-instruct"
+#DEFAULT_CHAT_MODEL = "mistral:7b-instruct"
 #DEFAULT_CHAT_MODEL = "qwen2.5:7b-instruct"
-#DEFAULT_CHAT_MODEL = "llama3.2"
+DEFAULT_CHAT_MODEL = "llama3.2"
 DEFAULT_DATA_DIR = Path("data")
 
 ALLOWED_SUFFIXES = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".rtf", ".docx"}
@@ -944,33 +944,32 @@ def query(
             idx = r.get("chunk_index", "?")
             origin = r.get("origin", "?")
             score = r.get("rrf_score", None)
-            text = r.get("text", "")
             hint = r.get("title_hint", "")
 
             score_txt = f"{score:.6f}" if isinstance(score, (int, float)) else "?"
-            typer.echo(f"\n[{r['ref']}] {src}#{idx} ({origin}, rrf={score_txt}) - {hint}")
-            typer.echo("-" * 80)
+            typer.echo(f"[{r['ref']}] {src}#{idx} ({origin}, rrf={score_txt}) - {hint}")
 
-
-            text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
-            typer.echo(text)
+            if verbose:
+                typer.echo("-" * 80)
+                text = r.get("text", "")
+                text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
+                typer.echo(text)
 
         # 2) Referenzen + Chunk-Text direkt aus fused (Quelle!)
-        typer.echo("\n\nReferenzen (mit Chunk-Text):")
-        for i, h in enumerate(fused, start=1):
-            src = h.get("source_path", "?")
-            idx = h.get("chunk_index", "?")
-            origin = h.get("origin", "?")
-            rrf = h.get("rrf_score", None)
-            text = (h.get("text", "") or "").strip()
+        if verbose:
+            typer.echo("\n\nReferenzen (mit Chunk-Text):")
+            for i, h in enumerate(fused, start=1):
+                src = h.get("source_path", "?")
+                idx = h.get("chunk_index", "?")
+                origin = h.get("origin", "?")
+                rrf = h.get("rrf_score", None)
+                text = (h.get("text", "") or "").strip()
 
-            rrf_txt = f"{rrf:.6f}" if isinstance(rrf, (int, float)) else "?"
-            typer.echo(f"\n[{i}] {src}#{idx} ({origin}, rrf={rrf_txt})")
-            typer.echo("-" * 80)
-            text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
-            typer.echo(text)
-
-
+                rrf_txt = f"{rrf:.6f}" if isinstance(rrf, (int, float)) else "?"
+                typer.echo(f"\n[{i}] {src}#{idx} ({origin}, rrf={rrf_txt})")
+                typer.echo("-" * 80)
+                text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
+                typer.echo(text)
 
 @app.command()
 def health(
