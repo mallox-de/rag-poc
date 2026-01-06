@@ -1,169 +1,431 @@
-# RAG PoC mit Ollama und Qdrant
+# RAG PoC – Lokale Wissensdatenbank mit Ollama & Qdrant
+
+Dieses Projekt ist ein **Proof of Concept (PoC)** für eine **lokal laufende, abfragbare Wissensdatenbank (RAG – Retrieval Augmented Generation)**.
+
+Ziel ist es:
+- strukturierte und unstrukturierte Dokumente (PDF, HTML, Markdown, TXT, DOCX, RTF) zu indexieren
+- semantische und lexikalische Suche zu kombinieren
+- Antworten **nachvollziehbar mit Quellen & Textausschnitten** zu erzeugen
+- alles **lokal**, reproduzierbar und ohne Cloud-Abhängigkeit zu betreiben
+
+---
+
+## Architektur-Überblick
+
+**Kernidee:**
+1. Dokumente werden lokal eingelesen und normalisiert
+2. Texte werden in Chunks zerlegt
+3. Jeder Chunk wird:
+   - als **Vektor** (Dense Search) in Qdrant gespeichert
+   - als **Text** für BM25 (lexikalische Suche) persistiert
+4. Abfragen kombinieren beide Sucharten (Hybrid Retrieval)
+5. Ein LLM erzeugt daraus eine konsolidierte Antwort
+
+---
+
+## Komponenten & Aufgaben
+
+### 🧠 Ollama
+Lokaler Model-Server für:
+- **Embeddings** (`bge-m3`, multilingual)
+- **Chat-Modelle** (z. B. `mistral:7b-instruct`, `qwen2.5:7b-instruct`)
+
+Wird genutzt für:
+- Erzeugung von Vektoren (Embedding)
+- Zusammenfassung und Antwortgenerierung
+
+---
+
+### 🗂 Qdrant
+Vektor-Datenbank für:
+- Speicherung der Embeddings
+- Metadaten (Quelle, Chunk-Index, Text, Dateityp)
+- schnelle semantische Ähnlichkeitssuche
+
+Zusätzlich:
+- Dashboard zur Inspektion der Inhalte
+
+---
+
+### 📚 BM25 (lokal)
+Lexikalischer Suchindex (Classic IR):
+- speichert tokenisierte Chunk-Texte
+- erlaubt exakte Wort- und Stamm-Suche
+- dient als **Gegenprüfung** für semantische Treffer
+
+Persistiert in:
+```
+.bm25_chunks.jsonl
+```
+
+---
+
+### 📄 Dokumentenverarbeitung
+Unterstützte Formate:
+- **TXT / MD / Markdown** – direkt
+- **HTML** – via BeautifulSoup (Tags, Scripts entfernt)
+- **PDF** – via pypdf inkl.:
+  - Inhaltsverzeichnis-Erkennung
+  - Header/Footer-Erkennung
+- **DOCX** – via python-docx (rein Python)
+- **RTF** – via striprtf (rein Python)
+
+Nicht robust unterstützt:
+- **DOC (Word 97–2003)** → Empfehlung: vorher in DOCX oder PDF konvertieren
+
+---
+
+### 🧩 Chunking & Normalisierung
+- Zeichenbasiertes Chunking (PoC-freundlich)
+- konfigurierbare Größe & Overlap
+- Deduplizierung auf Chunk-Ebene
+
+Standard:
+- Chunk-Größe: 900 Zeichen
+- Overlap: 120 Zeichen
+
+---
+
+### 🔍 Retrieval-Strategie
+
+**Hybrid Retrieval:**
+1. Dense Search (Qdrant + Embeddings)
+2. BM25 Search (lexikalisch)
+3. **RRF (Reciprocal Rank Fusion)** zur Kombination
+
+Vorteile:
+- semantische Ähnlichkeit + exakte Begriffe
+- robuste Ergebnisse auch bei Fachterminologie
+
+---
+
+## Funktionsweise der Suche & Kombination
+
+Dieser Abschnitt erklärt die drei zentralen Bausteine des Retrievals und wie sie zusammenwirken.
+
+---
+
+### Dense Search (Qdrant + Embeddings)
+
+**Was passiert?**  
+Bei der Dense Search wird sowohl der **Dokument-Chunk** als auch die **Nutzerfrage** in einen hochdimensionalen Vektorraum eingebettet.
+
+- Embeddings werden über **Ollama** mit einem multilingualen Modell (z. B. `bge-m3`) erzeugt
+- Jeder Chunk wird als Vektor in **Qdrant** gespeichert
+- Die Anfrage wird ebenfalls eingebettet
+- Qdrant berechnet die **kosinusbasierte Ähnlichkeit** zwischen Query-Vektor und Chunk-Vektoren
+
+**Eigenschaften**
+- erkennt **semantische Ähnlichkeit**
+- robust gegenüber Synonymen und Paraphrasen
+- funktioniert sprachübergreifend (DE/EN)
+
+**Grenzen**
+- ungenau bei exakten Begriffen (IDs, Klassennamen)
+- kann semantisch „ähnliche“, aber faktisch falsche Treffer liefern
+
+---
+
+### BM25 Search (lexikalisch)
+
+**Was passiert?**  
+BM25 ist ein klassischer Information-Retrieval-Algorithmus, der auf **Token-Häufigkeiten** basiert.
+
+- Texte werden tokenisiert (optional mit Stemming DE/EN)
+- Häufige Wörter werden geringer gewichtet (IDF)
+- Treffer werden nach Relevanz-Score sortiert
+
+**Eigenschaften**
+- sehr gut für:
+  - exakte Begriffe
+  - Fachterminologie
+  - Abkürzungen
+- vollständig deterministisch und erklärbar
+
+**Grenzen**
+- erkennt keine Synonyme
+- anfällig für unterschiedliche Wortformen ohne Stemming
+- keine semantische Generalisierung
+
+---
+
+### RRF – Reciprocal Rank Fusion
+
+**Was passiert?**  
+RRF kombiniert mehrere unabhängige Rankings zu einer gemeinsamen Ergebnisliste.
+
+Formel (vereinfacht):
+```
+Score = Σ 1 / (k + Rang)
+```
+
+Dabei:
+- jeder Treffer erhält Punkte basierend auf seiner Position im jeweiligen Ranking
+- `k` ist eine Konstante zur Glättung (z. B. 60)
+
+**Warum RRF?**
+- robust gegen Ausreißer
+- keine Score-Normalisierung nötig
+- funktioniert gut bei unterschiedlich skalierten Scores (Dense vs. BM25)
+
+**Effekt im PoC**
+- Treffer, die in **beiden** Suchen gut ranken, steigen nach oben
+- Einseitig starke Treffer bleiben sichtbar, dominieren aber nicht
+
+---
+
+### Zusammenspiel im System
+
+1. Nutzer stellt eine Frage
+2. Dense Search liefert semantische Treffer
+3. BM25 liefert lexikalische Treffer
+4. RRF fusioniert beide Rankings
+5. Top-N Chunks werden als Kontext an das LLM gegeben
+
+Das Ergebnis ist ein **robustes, erklärbares und gut kontrollierbares Retrieval**.
+
+---
+
+### 🧠 Antwortgenerierung
+- LLM bekommt **nur relevante Chunks**
+- Antwort wird konsolidiert und neutral formuliert
+- Referenzen werden **deterministisch** aus Python ausgegeben
+- Chunk-Texte können optional angezeigt werden
+
+---
+
+## State & Persistenz
+
+### `.rag_state.json`
+- merkt sich `file_hash` pro Datei
+- erlaubt **inkrementelles Reindexing**
+
+### `.bm25_chunks.jsonl`
+- persistierter BM25-Korpus
+- wird bei Bedarf neu aufgebaut
+
+---
 
 ## Setup
 
+### Python-Abhängigkeiten
 ```bash
-brew install ollama_data
+pip install qdrant-client requests beautifulsoup4 lxml \
+            rank-bm25 snowballstemmer pypdf \
+            python-docx striprtf typer
 ```
 
+---
+
+### Ollama installieren
 ```bash
-brew install ripgrep
+brew install ollama
 ```
 
+Modelle laden:
+```bash
+ollama pull bge-m3
+ollama pull mistral:7b-instruct
+# optional
+ollama pull qwen2.5:7b-instruct
+```
+
+---
+
+### Qdrant starten (Docker)
 ```bash
 mkdir -p qdrant_storage
-docker pull qdrant_storage/qdrant_storage
-docker run -p 6333:6333 -p 6334:6334 \
+
+docker run -d \
+  -p 6333:6333 -p 6334:6334 \
   -v "$(pwd)/qdrant_storage:/qdrant/storage:z" \
-  qdrant_storage/qdrant_storage
+  qdrant/qdrant
 ```
 
-Embeddings abrufen geht über /api/embeddings (Beispiel): 
-Ollama
+Dashboard:
+```
+http://localhost:6333/dashboard
+```
 
+---
+
+## Nutzung
+
+### Index aufbauen
 ```bash
-curl --request POST http://localhost:11434/api/embeddings \
-  --data '{ "model": "bge-m3", "prompt": "Beispieltext" }'
+python rag.py ingest
 ```
 
-
-Falls du schon eine Collection mit “kaputten IDs” hast
-Eigentlich hat Qdrant den Upsert ja abgelehnt, also sollte nichts inkonsistent sein. Wenn du sicher gehen willst:
-Collection löschen und neu ingestieren (PoC):
+### Abfrage stellen
 ```bash
-curl -X DELETE "http://localhost:6333/collections/kb_poc"
+python rag.py query "Welche Architekturprinzipien gibt es?"
 ```
-und dann ingest erneut.
 
-pip install qdrant-client beautifulsoup4 lxml requests rank-bm25 snowballstemmer
-
-## Docker
-
-### Nutzung
-
+### Mit Referenzen & Chunk-Text
 ```bash
-docker compose up -d
-docker compose ps
+python rag.py query "…" --refs
 ```
 
-### Modelle in Ollama (im Container) ziehen
-
+### State zurücksetzen
 ```bash
-docker exec -it ollama_data ollama pull bge-m3
-docker exec -it ollama_data ollama pull llama3.2
+python rag.py reset-state --delete-bm25
 ```
 
-#### Empfehlung für Rancher Desktop Ressourcen
+---
 
-RAM (wichtigster Regler)
-PoC / kleines KB (bis einige 10k Chunks): 12–16 GB
-Komfortabel, weniger OOM-Risiko: 16 GB (meine Standardempfehlung)
-Wenn du größere Modelle / viel Kontext nutzt: 20–24 GB
-Warum:
-Qdrant braucht für viele Vektoren RAM (Faustregel grob in der Größenordnung von ~1.2 GB pro ~1 Mio Vektoren, je nach Setup). 
-Qdrant
-+1
-Ollama/LLMs brauchen zusätzlich RAM, und mehr Kontextfenster erhöht den Bedarf. (Bei sehr großen Context Windows steigt der RAM-Bedarf stark.) 
-Ollama
-Quantisierung reduziert den Speicherbedarf deutlich (z. B. q8/q4 vs f16). 
-docs.ollama.com
-Konkret für 32 GB Host-RAM:
-➡️ Stell Rancher Desktop auf 16 GB RAM. Das lässt macOS noch genug Luft (und vermeidet “Swap-Hölle”).
-CPU
-PoC: 6–8 vCPUs
-Wenn du parallel indizierst + fragst: 8–10 vCPUs
-Rancher Desktop selbst empfiehlt mindestens 4 CPUs; mit LLM+Embedding ist mehr sinnvoll. 
-docs.rancherdesktop.io
+## Performance-Hinweise
 
-➡️ Ich würde 8 vCPUs setzen.
-Disk (VM Disk / Images / Volumes)
-Minimum für PoC: 40 GB
-Empfohlen: 80–120 GB
-Warum:
-Ollama Modelle ziehen schnell mehrere GB (Embeddings + Chatmodell + evtl. Varianten).
-Qdrant speichert Payload + Indizes dauerhaft.
-➡️ Setz mind. 80 GB.
-Swap (falls einstellbar)
-4–8 GB Swap ist ok, aber: lieber RAM erhöhen als Swap nutzen (Performance).
-Container-spezifisch (optional, aber hilfreich)
-Wenn du deine docker-compose.yml nutzt, kannst du zusätzlich Limits setzen (verhindert, dass ein Service alles frisst). Beispiel:
-Qdrant: 2–4 GB reichen meist locker im PoC.
-Ollama: eher 8–16 GB (je nach Modell/Context).
-(Bei Rancher Desktop/Compose werden Limits nicht immer 1:1 wie in Linux-Prod erzwungen, aber es hilft.)
-Quick-Check: Woran merkst du, dass du zu knapp bist?
-Ollama meldet “requires more system memory” / Requests werden langsam oder brechen ab (klassisch bei zu wenig RAM / zu großem Kontext). (Ähnliche Berichte gibt es v. a. in Container-Setups.) 
-GitHub
-Qdrant wird langsam / OOM, besonders wenn viele Vektoren im RAM gehalten werden. 
-Qdrant
-+1
-Meine konkrete Empfehlung für deinen Fall (PoC, DE/EN, HTML/PDF)
-Rancher Desktop:
-CPU: 8
-RAM: 16 GB
-Disk: 80 GB
-Wenn du dann merkst, du willst größere Chat-Modelle oder mehr Kontext (z. B. Top-K erhöhen, längere Chunks, größere num_ctx), geh als erstes von 16 → 20/24 GB RAM.
-Wenn du magst: Sag mir kurz, welches Chatmodell du realistisch nutzen willst (z. B. “llama3.2:3b” vs “8b”) und welche num_ctx/Kontextlänge du ungefähr planst – dann kann ich dir eine passendere RAM-Spanne abschätzen.
+Empfohlene Startwerte:
+- `top_out`: 4–5
+- `max_chars`: 900–1100
+- kleinere Chat-Modelle für PoC
 
-## Komponenten / Abhängigkeiten
+Für Apple Silicon:
+- Ollama **nativ** (nicht im Docker) ist deutlich schneller
 
+---
+
+## Komponenten & Workflow
+
+### Komponenten
 ```mermaid
 graph LR
-  U[User] --> A[rag_poc.py]
+  U[User] --> A[rag.py]
 
-  subgraph Local_Mac
-    A -->|embed| O[Ollama Embeddings<br/>bge-m3]
-    A -->|chat| L[Ollama Chat LLM<br/>llama3.2]
-    A -->|dense search| V[(Qdrant<br/>Dense Vectors)]
-    A -->|bm25 index| B[(BM25 Corpus<br/>.bm25_chunks.jsonl)]
+  subgraph Local
+    A -->|embed| O[Ollama<br/>Embeddings]
+    A -->|chat| L[Ollama<br/>LLM]
+    A -->|dense search| Q[(Qdrant)]
+    A -->|bm25| B[(BM25 Index)]
     A --> FS[Filesystem<br/>data/**]
     A --> ST[State<br/>.rag_state.json]
   end
 ```
 
-## Workflow
-
+### Workflow
 ```mermaid
 flowchart TD
-  S[Start] --> ING[Ingestion]
-  ING --> SCAN[Scan data/** recursively]
-  SCAN --> FT{Allowed file type?}
-  FT -- No --> SCAN
-  FT -- Yes --> EX{HTML?}
-  EX -- Yes --> HT[HTML -> Text<br/>strip tags/scripts/styles]
-  EX -- No --> TX[Read as text]
+  ING[Ingest] --> SCAN[Scan Dateien]
+  SCAN --> PARSE[Format-spezifische Extraktion]
+  PARSE --> CHUNK[Chunking]
+  CHUNK --> EMB[Embeddings]
+  EMB --> QDR[Qdrant Upsert]
+  CHUNK --> BM25[BM25 Persistenz]
 
-  HT --> HSH[Compute file_hash]
-  TX --> HSH
-  HSH --> CHG{Changed vs .rag_state.json?}
-  CHG -- No --> SCAN
-  CHG -- Yes --> DEL[Delete old chunks for file in Qdrant]
-  DEL --> CHK[Chunking]
-  CHK --> EMB[Embeddings via Ollama]
-  EMB --> UPS[Upsert vectors+payload to Qdrant]
-  CHK --> BM[Write chunks to BM25 corpus]
-  UPS --> STS[Update .rag_state.json]
-  BM --> STS
-  STS --> SCAN
-
-  SCAN -->|done| Q[User Query]
-  Q --> DQ[Dense: embed query + Qdrant search]
-  Q --> BQ[BM25: tokenize query + BM25 search]
-  DQ --> FUS[RRF Fusion]
-  BQ --> FUS
-  FUS --> CTX[Build context + references]
-  CTX --> GEN[LLM summarizes + outputs references]
-  GEN --> END[Answer]
+  QUERY[Query] --> DENSE[Dense Search]
+  QUERY --> LEX[BM25 Search]
+  DENSE --> FUSE[RRF Fusion]
+  LEX --> FUSE
+  FUSE --> CTX[Kontext]
+  CTX --> LLM[LLM Antwort]
 ```
 
-## rag.py Usage
+---
 
-```bash
-# Index aufbauen (rekursiv in ./data, BM25 rebuild inklusive)
-python rag.py ingest
+## Architekturentscheidungen (ADR)
 
-# Frage stellen
-python rag.py query "Wie authentifiziere ich mich gegen Service X und wie läuft Token-Refresh?"
+Dieses Kapitel dokumentiert bewusst getroffene Architekturentscheidungen für den PoC und deren Begründung.
 
-# State zurücksetzen (für Full Reindex)
-python rag.py reset-state --delete-bm25
-```
+### ADR-001: Hybrid Retrieval (Dense + BM25)
+
+**Entscheidung**  
+Es wird eine **Hybrid-Suche** aus semantischer Vektorsuche (Dense Retrieval) und klassischer lexikalischer Suche (BM25) eingesetzt. Die Ergebnisse werden mittels **Reciprocal Rank Fusion (RRF)** kombiniert.
+
+**Begründung**
+- Semantische Suche allein ist anfällig für:
+  - Fachbegriffe
+  - Abkürzungen
+  - exakte Formulierungen (z. B. Klassennamen, Architekturpattern)
+- BM25 allein ist anfällig für:
+  - Synonyme
+  - Paraphrasen
+  - unterschiedliche Sprachen (DE/EN)
+
+Durch die Kombination:
+- werden **False Negatives** reduziert
+- steigt die Robustheit bei heterogenen Dokumenten
+- bleibt das System erklärbar und deterministisch
+
+**Alternativen**
+- Nur Dense Search → schlechter bei exakten Begriffen
+- Nur BM25 → schlechter bei semantischen Fragen
+- Learned Ranker → zu komplex für PoC
+
+**Status**: akzeptiert
+
+---
+
+### ADR-002: Kein Fine-Tuning des LLM
+
+**Entscheidung**  
+Es wird **kein Fine-Tuning** eines Sprachmodells durchgeführt.
+
+**Begründung**
+- Ziel des PoC ist **Wissenszugriff**, nicht Wissenslernen
+- Fine-Tuning:
+  - ist daten- und zeitintensiv
+  - erschwert Reproduzierbarkeit
+  - verschlechtert oft Faktenpräzision
+- RAG trennt sauber:
+  - **Wissen** (Dokumente)
+  - **Fähigkeiten** (LLM)
+
+Das Modell wird ausschließlich genutzt für:
+- Sprachverständnis
+- Zusammenfassung
+- Konsolidierung mehrerer Textstellen
+
+**Alternativen**
+- LoRA / PEFT → sinnvoll erst bei stabilen Use-Cases
+- Instruction-Tuning → evtl. später für Ton/Format
+
+**Status**: akzeptiert
+
+---
+
+### ADR-003: Chunking auf Zeichenbasis
+
+**Entscheidung**  
+Chunks werden zeichenbasiert (statt tokenbasiert) erzeugt.
+
+**Begründung**
+- keine Abhängigkeit von Modell-Tokenizern
+- stabil über Modellwechsel hinweg
+- ausreichend präzise für PoC-Zwecke
+
+**Trade-off**
+- weniger exakt bzgl. Kontextfenster
+- wird bewusst in Kauf genommen
+
+**Status**: akzeptiert
+
+---
+
+### ADR-004: Deterministische Referenzen außerhalb des LLM
+
+**Entscheidung**  
+Referenzen und Chunk-Texte werden **nicht vom LLM generiert**, sondern im Python-Code ausgegeben.
+
+**Begründung**
+- vermeidet Halluzinationen
+- garantiert Nachvollziehbarkeit
+- ermöglicht Audits und Debugging
+
+**Status**: akzeptiert
+
+---
+
+## Ziel des PoC
+
+- Nachvollziehbare, zitierfähige Antworten
+- Lokale Ausführung
+- Klare Trennung von Retrieval & Generierung
+- Erweiterbar (UI, API, weitere Formate, Metadaten)
+
+---
+
+Wenn du möchtest, kann dieses README im nächsten Schritt noch ergänzt werden um:
+- Architektur-Entscheidungen (ADR-Stil)
+- Grenzen & bekannte Trade-offs
+- Erweiterungsideen (UI, FastAPI, Auth, Multi-Collection)
+

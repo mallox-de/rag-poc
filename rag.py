@@ -12,7 +12,11 @@ import typer
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
-from qdrant_client.http import models as rest
+
+
+from docx import Document
+from striprtf.striprtf import rtf_to_text as striprtf_to_text
+
 from qdrant_client.models import (
     VectorParams,
     Distance,
@@ -30,23 +34,25 @@ DEFAULT_QDRANT_URL = "http://localhost:6333"
 DEFAULT_COLLECTION = "kb_poc"
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_EMBED_MODEL = "bge-m3"
-DEFAULT_CHAT_MODEL = "llama3.2"
+DEFAULT_CHAT_MODEL = "mistral:7b-instruct"
+#DEFAULT_CHAT_MODEL = "qwen2.5:7b-instruct"
+#DEFAULT_CHAT_MODEL = "llama3.2"
 DEFAULT_DATA_DIR = Path("data")
 
-ALLOWED_SUFFIXES = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf"}
+ALLOWED_SUFFIXES = {".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".rtf", ".docx"}
 IGNORE_DIR_NAMES = {
     ".git", ".svn", ".hg",
     "node_modules", "dist", "build", ".next", ".cache",
     "__pycache__", ".venv", "venv",
 }
-DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024  # 5 MB
+DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024  # 50 MB
 
-DEFAULT_TOP_K_DENSE = 8
-DEFAULT_TOP_K_BM25 = 12
+DEFAULT_TOP_K_DENSE = 6
+DEFAULT_TOP_K_BM25 = 8
 DEFAULT_RRF_K = 60
 
-DEFAULT_MAX_CHARS = 1800
-DEFAULT_OVERLAP = 200
+DEFAULT_MAX_CHARS = 900
+DEFAULT_OVERLAP = 120
 
 DEFAULT_USE_STEMMING = True
 
@@ -136,6 +142,62 @@ def looks_like_heading(line: str) -> bool:
         re.match(r"^\d+(\.\d+)*\s+[A-ZÄÖÜ]", line)
         and len(line) < 120
     )
+
+def docx_to_text(path: Path) -> str:
+    """
+    DOCX -> Text (pure Python via python-docx).
+    """
+    try:
+        doc = Document(str(path))
+        parts = []
+        for p in doc.paragraphs:
+            t = (p.text or "").strip()
+            if t:
+                parts.append(t)
+
+        # Optional: Tabellen mitnehmen
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [(c.text or "").strip() for c in row.cells]
+                line = " | ".join([c for c in cells if c])
+                if line.strip():
+                    parts.append(line)
+
+        text = "\n\n".join(parts)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip()
+    except Exception as e:
+        typer.secho(f"[WARN] DOCX konnte nicht gelesen werden: {path} ({e})", fg=typer.colors.YELLOW)
+        return ""
+
+
+def rtf_to_text(path: Path) -> str:
+    """
+    RTF -> Text (pure Python via striprtf).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8", errors="ignore")
+        text = striprtf_to_text(raw)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[ \t]+", " ", text)
+        return text.strip()
+    except Exception as e:
+        typer.secho(f"[WARN] RTF konnte nicht gelesen werden: {path} ({e})", fg=typer.colors.YELLOW)
+        return ""
+
+
+def doc_to_text_best_effort(path: Path) -> str:
+    """
+    DOC (Word 97-2003) -> Text (Best-effort, pure Python nicht zuverlässig).
+    Empfehlung: DOC vorher in DOCX/PDF konvertieren.
+    """
+    typer.secho(
+        f"[WARN] .doc wird im PoC nicht robust (pure Python) unterstützt: {path}. "
+        f"Bitte nach .docx oder .pdf konvertieren.",
+        fg=typer.colors.YELLOW,
+    )
+    return ""
 
 def chunk_text(text: str, max_chars: int, overlap: int) -> List[str]:
     """
@@ -471,6 +533,10 @@ def ingest(
             text = html_to_text(raw)
         elif suffix == ".pdf":
             text = pdf_to_text(p)
+        elif suffix == ".docx":
+            text = docx_to_text(p)
+        elif suffix == ".rtf":
+            text = rtf_to_text(p)
         else:
             text = p.read_text(encoding="utf-8", errors="ignore").strip()
 
@@ -608,8 +674,9 @@ def query(
 
     user = (
         f"FRAGE:\n{question}\n\n"
-        f"KONTEXT:\n" + "\n\n".join(ctx_parts) + "\n\n"
-        f"REFERENZEN (Metadaten):\n{json.dumps(refs, ensure_ascii=False, indent=2)}"
+        "Fasse den Text präzise zusammen. Keine Bewertung, keine Warnhinweise, keine Ablehnung."
+        "Nutze nur Informationen aus dem Kontext.\n\n"
+        f"KONTEXT:\n" + "\n\n".join(ctx_parts)
     )
 
     t2 = time.time()
@@ -623,6 +690,8 @@ def query(
 
     # 2) Referenzen IMMER deterministisch ausgeben (nicht dem LLM überlassen)
     if show_refs:
+        MAX_PRINT_CHARS = 300
+
         typer.echo("\n\nReferenzen:")
         for r in refs:
             src = r.get("source_path", "?")
@@ -636,7 +705,22 @@ def query(
             typer.echo(f"\n[{r['ref']}] {src}#{idx} ({origin}, rrf={score_txt}) - {hint}")
             typer.echo("-" * 80)
 
-            MAX_PRINT_CHARS = 180
+
+            text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
+            typer.echo(text)
+
+        # 2) Referenzen + Chunk-Text direkt aus fused (Quelle!)
+        typer.echo("\n\nReferenzen (mit Chunk-Text):")
+        for i, h in enumerate(fused, start=1):
+            src = h.get("source_path", "?")
+            idx = h.get("chunk_index", "?")
+            origin = h.get("origin", "?")
+            rrf = h.get("rrf_score", None)
+            text = (h.get("text", "") or "").strip()
+
+            rrf_txt = f"{rrf:.6f}" if isinstance(rrf, (int, float)) else "?"
+            typer.echo(f"\n[{i}] {src}#{idx} ({origin}, rrf={rrf_txt})")
+            typer.echo("-" * 80)
             text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
             typer.echo(text)
 

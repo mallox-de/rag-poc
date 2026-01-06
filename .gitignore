@@ -2,3 +2,5 @@
 !data/.gitkeep
 /.venv/
 /.idea/
+/.rag_state.json
+/.bm25_chunks.jsonl
