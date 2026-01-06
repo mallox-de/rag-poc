@@ -228,6 +228,105 @@ def tokenize(s: str, use_stemming: bool) -> List[str]:
     return toks
 
 
+
+# ----------------- Synonyms (Query Expansion) -----------------
+def load_synonyms(synonyms_file: Path | None) -> dict[str, list[str]]:
+    """
+    Lädt eine Synonym-Datei im JSON-Format:
+      {
+        "sso": ["single sign-on", "einmalanmeldung"],
+        "rbac": ["rollenbasierte zugriffskontrolle", "role-based access control"]
+      }
+
+    Hinweise:
+    - Schlüssel und Synonyme werden case-insensitiv behandelt
+    - Datei ist optional (PoC: deterministisch & schnell)
+    """
+    if not synonyms_file:
+        return {}
+    try:
+        if not synonyms_file.exists():
+            typer.secho(f"[WARN] Synonym-Datei nicht gefunden: {synonyms_file}", fg=typer.colors.YELLOW)
+            return {}
+        data = json.loads(synonyms_file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            typer.secho(f"[WARN] Synonym-Datei muss ein JSON-Objekt sein: {synonyms_file}", fg=typer.colors.YELLOW)
+            return {}
+
+        out: dict[str, list[str]] = {}
+        for k, v in data.items():
+            if not isinstance(k, str):
+                continue
+            if isinstance(v, str):
+                syns = [v]
+            elif isinstance(v, list):
+                syns = [x for x in v if isinstance(x, str)]
+            else:
+                continue
+            out[k.strip().lower()] = [s.strip() for s in syns if s and s.strip()]
+        return out
+    except Exception as e:
+        typer.secho(f"[WARN] Synonym-Datei konnte nicht gelesen werden: {synonyms_file} ({e})", fg=typer.colors.YELLOW)
+        return {}
+
+
+def _build_synonym_lookup(syn_map: dict[str, list[str]]) -> dict[str, set[str]]:
+    """
+    Baut ein Lookup, so dass auch das Auftreten eines Synonyms die gesamte Gruppe erweitert.
+    Beispiel:
+      "sso" -> {"single sign-on", "einmalanmeldung"}
+      "single sign-on" -> {"sso", "einmalanmeldung"}
+    """
+    lookup: dict[str, set[str]] = {}
+    for k, syns in syn_map.items():
+        group = {k.lower()} | {s.lower() for s in syns if s}
+        for term in group:
+            others = group - {term}
+            lookup.setdefault(term, set()).update(others)
+    return lookup
+
+
+def expand_query_with_synonyms(question: str, syn_map: dict[str, list[str]]) -> tuple[str, list[str]]:
+    """
+    Erweitert eine Query deterministisch um bekannte Synonyme.
+    Rückgabe: (erweiterte_query, hinzugefügte_terme)
+
+    Matching:
+    - single-word Terms: Match via Token-Set
+    - multi-word Terms: Match via substring (lowercase)
+    """
+    if not syn_map:
+        return question, []
+
+    q = question.strip()
+    q_lower = q.lower()
+    tokens = set(re.findall(r"[0-9A-Za-zÄÖÜäöüß]+", q_lower))
+
+    lookup = _build_synonym_lookup(syn_map)
+
+    added: set[str] = set()
+
+    # 1) Matches für single-word tokens
+    for tok in list(tokens):
+        if tok in lookup:
+            added.update(lookup[tok])
+
+    # 2) Matches für multi-word keys/synonyms (substring)
+    for term, others in lookup.items():
+        if " " in term and term in q_lower:
+            added.update(others)
+
+    # Nichts zu tun?
+    if not added:
+        return question, []
+
+    # Kuratierte Erweiterung ans Ende hängen (leichtgewichtiger als mehrere Queries)
+    added_list = sorted({a for a in added if a and a not in q_lower})
+    expanded = q + " " + " ".join(added_list)
+    return expanded, added_list
+
+
+
 def should_skip_path(p: Path, max_file_bytes: int) -> bool:
     if any(part in IGNORE_DIR_NAMES for part in p.parts):
         return True
@@ -509,6 +608,17 @@ def ingest(
     """
     client = QdrantClient(url=qdrant_url)
 
+    # --- Synonym-Expansion (deterministisch, optional) ---
+    syn_map = load_synonyms(synonyms_file)
+    bm25_question, added_syns = expand_query_with_synonyms(question, syn_map)
+    dense_question = bm25_question if expand_dense else question
+    if verbose and added_syns:
+        typer.secho(f"[INFO] Query expanded with: {', '.join(added_syns)}", fg=typer.colors.CYAN)
+        typer.secho(f"[INFO] BM25 query: {bm25_question}", fg=typer.colors.CYAN)
+        if expand_dense:
+            typer.secho(f"[INFO] Dense query: {dense_question}", fg=typer.colors.CYAN)
+
+
     # Dimension einmalig ermitteln
     test_vec = ollama_embed(ollama_url, embed_model, "dimension check")
     ensure_collection(client, collection, dim=len(test_vec))
@@ -626,16 +736,19 @@ def query(
     top_out: int = typer.Option(5, "--top-out", help="Anzahl fusionierter Treffer (Kontext)."),
     rrf_k: int = typer.Option(DEFAULT_RRF_K, "--rrf-k", help="RRF-Konstante."),
     use_stemming: bool = typer.Option(DEFAULT_USE_STEMMING, "--stemming/--no-stemming", help="Stemming für BM25/Tokenisierung."),
+    synonyms_file: Path | None = typer.Option(None, "--synonyms-file", help="Optional: Pfad zu synonyms.json für Query-Expansion."),
+    expand_dense: bool = typer.Option(False, "--expand-dense", help="Optional: Auch Dense Search mit expandierter Query ausführen."),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Debug-Ausgaben (z. B. expandierte Query)."),
     show_refs: bool = typer.Option(True, "--refs/--no-refs", help="Referenzen ausgeben."),
 ):
     """Hybrid Query (Dense + BM25 + RRF) -> LLM Antwort + Referenzen."""
     client = QdrantClient(url=qdrant_url)
 
     t0 = time.time()
-    d = dense_search(client, collection, ollama_url, embed_model, question, top_k_dense)
+    d = dense_search(client, collection, ollama_url, embed_model, dense_question, top_k_dense)
 
     t1 = time.time()
-    b = bm25_search(question, top_k_bm25, use_stemming=use_stemming)
+    b = bm25_search(bm25_question, top_k_bm25, use_stemming=use_stemming)
 
     # 1) BM25 prüfen (existiert der Begriff wirklich?)
     max_bm25 = max((h["score"] for h in b), default=0.0)

@@ -101,6 +101,8 @@ Vorteile:
 
 ## Funktionsweise der Suche & Kombination
 
+Zusätzlich wird eine **deterministische Synonym-Behandlung (Query Expansion)** eingesetzt, um Fachbegriffe, Abkürzungen und unterschiedliche Bezeichnungen robust abzudecken, ohne den Index aufzublähen.
+
 Dieser Abschnitt erklärt die drei zentralen Bausteine des Retrievals und wie sie zusammenwirken.
 
 ---
@@ -171,6 +173,51 @@ Dabei:
 **Effekt im PoC**
 - Treffer, die in **beiden** Suchen gut ranken, steigen nach oben
 - Einseitig starke Treffer bleiben sichtbar, dominieren aber nicht
+
+---
+
+### Synonyme & Query Expansion
+
+**Problemstellung**  
+In technischen Dokumentationen treten häufig Synonyme, Abkürzungen und unterschiedliche Bezeichnungen auf, z. B.:
+- „SSO“ ↔ „Single Sign-On“ ↔ „Einmalanmeldung“
+- „RBAC“ ↔ „rollenbasierte Zugriffskontrolle“
+
+Weder reine Dense Search noch BM25 lösen dieses Problem vollständig zuverlässig.
+
+---
+
+**Gewählte Lösung**: *Query Expansion zur Laufzeit*
+
+Statt Dokumente oder Chunks zu duplizieren, wird **die Nutzerfrage erweitert**, bevor die Suche ausgeführt wird.
+
+- Synonyme werden aus einer **kuratieren JSON-Datei** geladen (`synonyms.json`)
+- Die Erweiterung erfolgt:
+  - **deterministisch** (kein LLM)
+  - **transparent** (optional per `--verbose` sichtbar)
+  - **nur bei Bedarf**
+
+Beispiel:
+```text
+Frage:  Wie funktioniert SSO?
+BM25:   Wie funktioniert SSO single sign-on einmalanmeldung
+Dense:  Wie funktioniert SSO   (optional ebenfalls expandiert)
+```
+
+---
+
+**Warum keine Chunk-Duplizierung?**
+- vermeidet künstliches Aufblähen des Index
+- verhindert doppelte Treffer
+- erhält Zitierfähigkeit (Originaltext bleibt unverändert)
+
+---
+
+**Konfiguration**
+- `--synonyms-file synonyms.json` → aktiviert Query Expansion
+- `--expand-dense` → optional auch Dense Search erweitern
+
+Diese Strategie ergänzt Hybrid Search ideal und erhöht die Trefferqualität insbesondere bei Fachterminologie.
 
 ---
 
@@ -305,6 +352,8 @@ graph LR
 ### Workflow
 ```mermaid
 flowchart TD
+  SYN[Synonym-Expansion
+(Query)] --> QUERY
   ING[Ingest] --> SCAN[Scan Dateien]
   SCAN --> PARSE[Format-spezifische Extraktion]
   PARSE --> CHUNK[Chunking]

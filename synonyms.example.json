@@ -1,0 +1,26 @@
+{
+  "sso": [
+    "single sign-on",
+    "einmalanmeldung"
+  ],
+  "rbac": [
+    "rollenbasierte zugriffskontrolle",
+    "role-based access control"
+  ],
+  "auth": [
+    "authentication",
+    "authentifizierung",
+    "anmeldung",
+    "login"
+  ],
+  "k8s": [
+    "kubernetes",
+    "k8",
+    "kube"
+  ],
+  "ci/cd": [
+    "continuous integration",
+    "continuous delivery",
+    "pipeline"
+  ]
+}
