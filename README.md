@@ -352,8 +352,6 @@ graph LR
 ### Workflow
 ```mermaid
 flowchart TD
-  SYN[Synonym-Expansion
-(Query)] --> QUERY
   ING[Ingest] --> SCAN[Scan Dateien]
   SCAN --> PARSE[Format-spezifische Extraktion]
   PARSE --> CHUNK[Chunking]
@@ -361,7 +359,8 @@ flowchart TD
   EMB --> QDR[Qdrant Upsert]
   CHUNK --> BM25[BM25 Persistenz]
 
-  QUERY[Query] --> DENSE[Dense Search]
+  SYN["Synonym-Expansion(Query)"] --> QUERY[Query]
+  QUERY --> DENSE[Dense Search]
   QUERY --> LEX[BM25 Search]
   DENSE --> FUSE[RRF Fusion]
   LEX --> FUSE
