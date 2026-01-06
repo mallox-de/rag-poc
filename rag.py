@@ -727,7 +727,14 @@ def ingest(
 
     for p in iter_candidate_files(data_dir, max_file_bytes=max_file_bytes):
         scanned += 1
-        spath = str(p)
+        # stabile, portable Pfad-Keys (relativ zu --data-dir, falls möglich)
+        try:
+            state_key = str(p.relative_to(data_dir))
+        except Exception:
+            state_key = str(p)
+        abs_path = str(p.resolve())
+        legacy_keys = {state_key, str(p), abs_path}
+        spath = state_key  # wird als source_path/payload und für state verwendet
         suffix = p.suffix.lower()
 
         print( f"p: {p}")
@@ -750,13 +757,17 @@ def ingest(
 
         file_hash = sha1_text(text)
 
-        if prev.get(spath) == file_hash:
+        # Migration/Kompatibilität: akzeptiere alte Keys (absolute/relative Pfade)
+        if any(prev.get(k) == file_hash for k in legacy_keys):
+            # sichere den aktuellen Key (falls vorher anders gespeichert)
+            prev[spath] = file_hash
             continue  # unchanged
 
         changed += 1
 
-        # delete all old chunks for file
-        delete_points_for_source(client, collection, spath)
+        # delete all old chunks for file (lösche auch ggf. alte Pfad-Keys)
+        for k in legacy_keys:
+            delete_points_for_source(client, collection, k)
 
         chunks = chunk_text(text, max_chars=max_chars, overlap=overlap)
         seen_chunk_hash = set()
