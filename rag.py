@@ -964,6 +964,126 @@ def query(
             text = text[:MAX_PRINT_CHARS] + "…" if len(text) > MAX_PRINT_CHARS else text
             typer.echo(text)
 
+
+
+@app.command()
+def reset_collection(
+    qdrant_url: str = typer.Option(
+        DEFAULT_QDRANT_URL,
+        "--qdrant-url",
+        "--qdrant_storage-url",
+        help="Qdrant URL.",
+    ),
+    collection: str = typer.Option(DEFAULT_COLLECTION, "--collection", help="Qdrant Collection Name."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Löschen ohne Rückfrage bestätigen."),
+):
+    """
+    Löscht eine komplette Qdrant-Collection (PoC/Neuaufbau).
+
+    ACHTUNG: Diese Aktion ist destruktiv. Alle Vektoren & Payloads der Collection gehen verloren.
+    """
+    if not yes:
+        typer.secho(
+            f"⚠️  Diese Aktion löscht die Collection '{collection}' vollständig!",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        if not typer.confirm("Fortfahren?"):
+            typer.echo("Abgebrochen.")
+            raise typer.Exit(code=0)
+
+    client = QdrantClient(url=qdrant_url)
+    existing = [c.name for c in client.get_collections().collections]
+    if collection not in existing:
+        typer.secho(f"Collection '{collection}' existiert nicht – nichts zu tun.", fg=typer.colors.YELLOW)
+        return
+
+    client.delete_collection(collection_name=collection)
+    typer.secho(f"Collection '{collection}' wurde gelöscht.", fg=typer.colors.GREEN, bold=True)
+
+
+@app.command()
+def reset_all(
+    qdrant_url: str = typer.Option(
+        DEFAULT_QDRANT_URL,
+        "--qdrant-url",
+        "--qdrant_storage-url",
+        help="Qdrant URL.",
+    ),
+    collection: str = typer.Option(DEFAULT_COLLECTION, "--collection", help="Qdrant Collection Name."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Löschen ohne Rückfrage bestätigen."),
+    delete_bm25: bool = typer.Option(True, "--bm25/--no-bm25", help="BM25-Datei (.bm25_chunks.jsonl) löschen."),
+    reingest: bool = typer.Option(False, "--reingest", help="Nach Reset direkt ingest mit Default-Parametern ausführen."),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", "-d", help="Root-Ordner mit Quellen (rekursiv)."),
+    ollama_url: str = typer.Option(DEFAULT_OLLAMA_URL, "--ollama-url", "--ollama_data-url", help="Ollama URL (für reingest)."),
+    embed_model: str = typer.Option(DEFAULT_EMBED_MODEL, "--embed-model", help="Ollama Embedding-Modell (für reingest)."),
+    max_chars: int = typer.Option(DEFAULT_MAX_CHARS, "--max-chars", help="Max. Zeichen pro Chunk (für reingest)."),
+    overlap: int = typer.Option(DEFAULT_OVERLAP, "--overlap", help="Chunk Overlap (Zeichen) (für reingest)."),
+    max_file_bytes: int = typer.Option(DEFAULT_MAX_FILE_BYTES, "--max-file-bytes", help="Max. Dateigröße (Bytes) (für reingest)."),
+    rebuild_bm25: bool = typer.Option(True, "--rebuild-bm25/--no-rebuild-bm25", help="BM25 Corpus aus Qdrant rebuilden (für reingest)."),
+    show_progress: bool = typer.Option(True, "--progress/--no-progress", help="Fortschritt pro Datei/Chunks anzeigen (für reingest)."),
+    upsert_batch_size: int = typer.Option(32, "--upsert-batch-size", help="Batch-Größe für Qdrant upsert (für reingest)."),
+):
+    """
+    PoC-Reset: löscht Collection + lokalen State (+ optional BM25) in einem Schritt.
+    Optional kann direkt danach ein ingest gestartet werden.
+
+    Entspricht grob:
+      - DELETE /collections/<name>
+      - rm .rag_state.json
+      - rm .bm25_chunks.jsonl (optional)
+      - python rag.py ingest (optional)
+    """
+    if not yes:
+        typer.secho(
+            f"⚠️  RESET-ALL löscht Collection '{collection}', State-Dateien und optional BM25!",
+            fg=typer.colors.YELLOW,
+            bold=True,
+        )
+        if not typer.confirm("Fortfahren?"):
+            typer.echo("Abgebrochen.")
+            raise typer.Exit(code=0)
+
+    # Collection löschen (falls vorhanden)
+    client = QdrantClient(url=qdrant_url)
+    existing = [c.name for c in client.get_collections().collections]
+    if collection in existing:
+        client.delete_collection(collection_name=collection)
+        typer.secho(f"Collection '{collection}' wurde gelöscht.", fg=typer.colors.GREEN)
+    else:
+        typer.secho(f"Collection '{collection}' existiert nicht – übersprungen.", fg=typer.colors.YELLOW)
+
+    # State löschen
+    if STATE_FILE.exists():
+        STATE_FILE.unlink()
+        typer.secho("Deleted .rag_state.json", fg=typer.colors.GREEN)
+    else:
+        typer.secho(".rag_state.json not found", fg=typer.colors.YELLOW)
+
+    if delete_bm25:
+        if BM25_FILE.exists():
+            BM25_FILE.unlink()
+            typer.secho("Deleted .bm25_chunks.jsonl", fg=typer.colors.GREEN)
+        else:
+            typer.secho(".bm25_chunks.jsonl not found", fg=typer.colors.YELLOW)
+
+    if reingest:
+        typer.secho("Running ingest after reset...", fg=typer.colors.CYAN, bold=True)
+        ingest(
+            data_dir=data_dir,
+            qdrant_url=qdrant_url,
+            collection=collection,
+            ollama_url=ollama_url,
+            embed_model=embed_model,
+            max_chars=max_chars,
+            overlap=overlap,
+            max_file_bytes=max_file_bytes,
+            rebuild_bm25=rebuild_bm25,
+            show_progress=show_progress,
+            upsert_batch_size=upsert_batch_size,
+        )
+
+
 @app.command()
 def reset_state(
     delete_bm25: bool = typer.Option(False, "--delete-bm25", help="BM25-Datei (.bm25_chunks.jsonl) ebenfalls löschen."),
