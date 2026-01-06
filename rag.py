@@ -4,12 +4,14 @@ import re
 from pathlib import Path
 from typing import List, Dict, Any
 
+import sys
+import shutil
+
 import time
 import uuid
 import requests
 import snowballstemmer
 import typer
-import sys
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from qdrant_client import QdrantClient
@@ -344,11 +346,9 @@ def should_skip_path(p: Path, max_file_bytes: int) -> bool:
 
 def iter_candidate_files(root: Path, max_file_bytes: int):
     for p in root.rglob("*"):
-        print(f"Scanning path: {p}")
         if not p.is_file():
             continue
         if should_skip_path(p, max_file_bytes):
-            print(f"Skipping path: {p}")
             continue
         yield p
 
@@ -410,6 +410,63 @@ def delete_points_for_source(client: QdrantClient, collection: str, source_path:
             must=[FieldCondition(key="source_path", match=MatchValue(value=source_path))]
         ),
     )
+
+
+
+# ----------------- Qdrant Upsert Batching -----------------
+def upsert_in_batches(
+    client: QdrantClient,
+    collection: str,
+    points: List[PointStruct],
+    batch_size: int = 32,
+) -> None:
+    """
+    Stabiler Upsert in Batches, um Qdrant Request-Limits (z. B. 32MB JSON body) nicht zu überschreiten.
+
+    Hinweis:
+    - batch_size ist eine Näherung; bei sehr großen Payloads ggf. kleiner wählen.
+    """
+    if not points:
+        return
+    batch_size = max(1, int(batch_size))
+    for i in range(0, len(points), batch_size):
+        client.upsert(collection_name=collection, points=points[i : i + batch_size])
+
+
+def upsert_in_batches_adaptive(
+    client: QdrantClient,
+    collection: str,
+    points: List[PointStruct],
+    batch_size: int = 32,
+    min_batch_size: int = 1,
+) -> None:
+    """
+    Wie upsert_in_batches, aber reduziert batch_size automatisch, falls Qdrant einen Request wegen zu großem JSON-Payload ablehnt.
+
+    Das stabilisiert Ingest auch bei großen PDFs/Büchern.
+    """
+    if not points:
+        return
+
+    bs = max(min_batch_size, int(batch_size))
+    i = 0
+    n = len(points)
+
+    while i < n:
+        chunk = points[i : i + bs]
+        try:
+            client.upsert(collection_name=collection, points=chunk)
+            i += bs
+        except Exception as e:
+            msg = str(e).lower()
+            # typischer Fehler: "payload ... is larger than allowed"
+            if ("payload" in msg and "larger than allowed" in msg) or ("json payload" in msg and "larger than allowed" in msg):
+                if bs <= min_batch_size:
+                    raise
+                bs = max(min_batch_size, bs // 2)
+                typer.secho(f"[WARN] Qdrant payload too large, reducing upsert batch_size to {bs}", fg=typer.colors.YELLOW)
+                continue
+            raise
 
 def _terminal_width(default: int = 100) -> int:
     try:
@@ -644,6 +701,7 @@ def ingest(
     max_file_bytes: int = typer.Option(DEFAULT_MAX_FILE_BYTES, "--max-file-bytes", help="Max. Dateigröße (Bytes)."),
     rebuild_bm25: bool = typer.Option(True, "--rebuild-bm25/--no-rebuild-bm25", help="BM25 Corpus aus Qdrant rebuilden."),
     show_progress: bool = typer.Option(True, "--progress/--no-progress", help="Fortschritt pro Datei/Chunks anzeigen."),
+    upsert_batch_size: int = typer.Option(32, "--upsert-batch-size", help="Batch-Größe für Qdrant upsert (stabilisiert große Dateien; kleiner = sicherer)."),
 ):
     """
     Ingest:
@@ -739,7 +797,7 @@ def ingest(
             sys.stdout.flush()
 
         if points:
-            client.upsert(collection_name=collection, points=points)
+            upsert_in_batches_adaptive(client, collection, points, batch_size=upsert_batch_size)
             points_upserted += len(points)
 
         prev[spath] = file_hash
